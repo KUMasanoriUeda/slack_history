@@ -26,7 +26,7 @@ services:
     environment:
       - TZ=Asia/Tokyo
     volumes:
-      - bot-data:/data:ro
+      - bot-data:/data
     logging:
       driver: "json-file"
       options:
