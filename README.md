@@ -99,6 +99,20 @@ docker compose up -d --build
 ### 4. Bot をチャンネルに招待
 
 対象チャンネルで `/invite @Bot名` を実行すると、メッセージの保存が開始されます。
+複数チャンネルに招待可能で、チャンネルごとにメッセージが保存・検索されます。
+
+### 5. Nextcloud バックアップ（オプション）
+
+`.env` に Nextcloud の情報を追加すると、6時間ごとに DB と添付ファイルが自動アップロードされます。
+
+```
+NEXTCLOUD_URL=https://your-nextcloud.example.com
+NEXTCLOUD_USER=your-username
+NEXTCLOUD_PASSWORD=your-password
+NEXTCLOUD_REMOTE_DIR=/slack_backup
+```
+
+バックアップ先の Nextcloud フォルダは自動作成されます。
 
 ## 技術構成
 
@@ -116,6 +130,8 @@ docker compose up -d --build
 ├── app.py              # Bot 本体（イベント処理・コマンド・検索）
 ├── db.py               # SQLite 操作（FTS5 全文検索・CRUD）
 ├── Dockerfile
+├── Dockerfile.backup    # Nextcloud バックアップ用コンテナ
+├── backup.sh            # バックアップスクリプト
 ├── docker-compose.yml
 ├── requirements.txt
 ├── .env.example
