@@ -43,6 +43,10 @@ def _get_bot_user_id():
     return bot_user_id
 
 
+def _replace_mentions(text: str) -> str:
+    return re.sub(r"<@(\w+)>", lambda m: f"@{_resolve_user_name(m.group(1))}", text)
+
+
 def _download_file(url: str, dest: str):
     token = os.environ["SLACK_BOT_TOKEN"]
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
@@ -76,7 +80,7 @@ def handle_message(event, say):
     if subtype == "message_changed":
         msg = event.get("message", {})
         channel_id = event.get("channel", "")
-        db.update_message(channel_id, msg.get("ts", ""), msg.get("text", ""))
+        db.update_message(channel_id, msg.get("ts", ""), _replace_mentions(msg.get("text", "")))
         logger.info("Updated message: channel=%s ts=%s", channel_id, msg.get("ts"))
         return
 
@@ -105,6 +109,7 @@ def handle_message(event, say):
         _dispatch(channel_id, query, message_ts, say)
         return
 
+    text = _replace_mentions(text)
     db.save_message(channel_id, message_ts, thread_ts, user_id, text)
     logger.info("Saved message: channel=%s ts=%s user=%s", channel_id, message_ts, user_id)
 
@@ -135,7 +140,10 @@ def _help_text() -> str:
         "• `@bot from:@ユーザー キーワード` — ユーザーで絞り込み\n"
         "• `@bot date:2024-01-01 キーワード` — 日付で絞り込み（その日以降）\n"
         "• `@bot date:2024-01-01~2024-01-31 キーワード` — 期間で絞り込み\n"
-        "*スレッド操作（スラッシュコマンド）*\n"
+        "*スラッシュコマンド*\n"
+        "• `/hist-search キーワード` — キーワード検索（自分だけに表示）\n"
+        "• `/hist-search from:@ユーザー キーワード` — ユーザーで絞り込み\n"
+        "• `/hist-search date:2024-01-01 キーワード` — 日付で絞り込み\n"
         "• `/thread 123` — スレッド ID:123 の内容を表示\n"
         "• `/files 123` — スレッド ID:123 の添付ファイルを取得\n"
         "• `/history-help` — この使い方を表示"
@@ -179,6 +187,18 @@ def cmd_thread(ack, command):
         return
 
     _handle_thread_detail(thread_id, None, lambda **kwargs: _ephemeral(command, **kwargs), thread=thread)
+
+
+@app.command("/hist-search")
+def cmd_search(ack, command):
+    ack()
+    query = command.get("text", "").strip()
+    if not query:
+        _ephemeral(command, text="使い方: `/hist-search キーワード`\n" + _help_text())
+        return
+    channel_id = command["channel_id"]
+    user_id = command["user_id"]
+    _handle_search_ephemeral(channel_id, query, user_id, page=1)
 
 
 @app.command("/files")
@@ -225,7 +245,7 @@ PREVIEW_REPLIES = 3
 
 def _build_search_blocks(channel_id: str, query: str, parsed: dict,
                          threads: list, total: int, page: int, total_pages: int,
-                         thread_ts: str) -> tuple[list, str]:
+                         thread_ts: str, mode: str = "mention") -> tuple[list, str]:
     desc = _build_search_description(parsed)
     blocks = [
         {
@@ -272,6 +292,7 @@ def _build_search_blocks(channel_id: str, query: str, parsed: dict,
         truncated_query = query[:500]
         pagination_value = json.dumps({
             "q": truncated_query, "ch": channel_id, "p": page, "ts": thread_ts,
+            "mode": mode,
         }, ensure_ascii=False)
 
         buttons = []
@@ -324,9 +345,47 @@ def _handle_search(channel_id: str, query: str, message_ts: str, say, page: int 
     blocks, desc = _build_search_blocks(
         channel_id, query, parsed,
         result["threads"], result["total"], page, result["total_pages"],
-        message_ts,
+        message_ts, mode="mention",
     )
     say(blocks=blocks, text=desc, thread_ts=message_ts)
+
+
+def _handle_search_ephemeral(channel_id: str, query: str, user_id: str, page: int = 1):
+    parsed = _parse_search_query(query)
+
+    if not parsed["keyword"] and not parsed["user_id"] and not parsed["date_from"]:
+        app.client.chat_postEphemeral(
+            channel=channel_id, user=user_id,
+            text="検索条件を指定してください。\n" + _help_text(),
+        )
+        return
+
+    result = db.search_threads(
+        channel_id,
+        parsed["keyword"],
+        user_id=parsed["user_id"],
+        date_from=parsed["date_from"],
+        date_to=parsed["date_to"],
+        per_page=5,
+        page=page,
+    )
+
+    if not result["threads"]:
+        app.client.chat_postEphemeral(
+            channel=channel_id, user=user_id,
+            text="一致するスレッドは見つかりませんでした。",
+        )
+        return
+
+    blocks, desc = _build_search_blocks(
+        channel_id, query, parsed,
+        result["threads"], result["total"], page, result["total_pages"],
+        thread_ts="", mode="ephemeral",
+    )
+    app.client.chat_postEphemeral(
+        channel=channel_id, user=user_id,
+        blocks=blocks, text=desc,
+    )
 
 
 @app.action("search_prev")
@@ -347,10 +406,15 @@ def _handle_pagination(body, delta: int):
     new_page = data["p"] + delta
     channel_id = data["ch"]
     query = data["q"]
-    thread_ts = data["ts"]
+    thread_ts = data.get("ts", "")
+    mode = data.get("mode", "mention")
 
     user_id = body["user"]["id"]
     if not _user_in_channel(user_id, channel_id):
+        return
+
+    if mode == "ephemeral":
+        _handle_search_ephemeral(channel_id, query, user_id, page=new_page)
         return
 
     parsed = _parse_search_query(query)
@@ -370,7 +434,7 @@ def _handle_pagination(body, delta: int):
     blocks, desc = _build_search_blocks(
         channel_id, query, parsed,
         result["threads"], result["total"], new_page, result["total_pages"],
-        thread_ts,
+        thread_ts, mode="mention",
     )
 
     msg_ts = body["message"]["ts"]

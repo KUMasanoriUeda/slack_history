@@ -33,5 +33,21 @@ services:
         max-size: "5m"
         max-file: "2"
 
+  dbadmin:
+    build:
+      context: .
+      dockerfile: Dockerfile.dbadmin
+    container_name: slack-chathistory-dbadmin
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - bot-data:/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
 volumes:
   bot-data:
