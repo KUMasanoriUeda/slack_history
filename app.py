@@ -26,13 +26,56 @@ bot_user_id = None
 
 
 @lru_cache(maxsize=500)
+def _resolve_user_id_by_name(name: str) -> str | None:
+    cached = db.get_user_by_name(name)
+    if cached:
+        return cached["user_id"]
+    try:
+        cursor = None
+        while True:
+            kwargs = {"limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = app.client.users_list(**kwargs)
+            for member in resp["members"]:
+                if member.get("deleted"):
+                    continue
+                profile = member.get("profile", {})
+                _cache_user(member)
+                for field in (member.get("name", ""), profile.get("display_name", ""), profile.get("real_name", "")):
+                    if field and field.lower() == name.lower():
+                        return member["id"]
+            cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+        return None
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=500)
 def _resolve_user_name(user_id: str) -> str:
+    cached = db.get_user_by_id(user_id)
+    if cached:
+        return cached["display_name"] or cached["real_name"] or user_id
     try:
         resp = app.client.users_info(user=user_id)
-        profile = resp["user"]["profile"]
+        user = resp["user"]
+        profile = user.get("profile", {})
+        _cache_user(user)
         return profile.get("display_name") or profile.get("real_name") or user_id
     except Exception:
         return user_id
+
+
+def _cache_user(member: dict):
+    profile = member.get("profile", {})
+    db.save_user(
+        member["id"],
+        member.get("name", ""),
+        profile.get("display_name", ""),
+        profile.get("real_name", ""),
+    )
 
 
 def _get_bot_user_id():
@@ -108,6 +151,9 @@ def handle_message(event, say):
             return
         _dispatch(channel_id, query, message_ts, say)
         return
+
+    if user_id and not db.get_user_by_id(user_id):
+        _resolve_user_name(user_id)
 
     text = _replace_mentions(text)
     db.save_message(channel_id, message_ts, thread_ts, user_id, text)
@@ -193,6 +239,7 @@ def cmd_thread(ack, command):
 def cmd_search(ack, command):
     ack()
     query = command.get("text", "").strip()
+    logger.info("/hist-search raw text: %r", query)
     if not query:
         _ephemeral(command, text="使い方: `/hist-search キーワード`\n" + _help_text())
         return
@@ -225,10 +272,17 @@ def _dispatch(channel_id: str, query: str, message_ts: str, say):
 def _parse_search_query(query: str) -> dict:
     result = {"keyword": "", "user_id": None, "date_from": None, "date_to": None}
 
-    user_match = re.search(r"from:<@(\w+)>", query)
+    user_match = re.search(r"from:\s*<@(\w+)(?:\|[^>]*)?>", query)
     if user_match:
         result["user_id"] = user_match.group(1)
         query = query[:user_match.start()] + query[user_match.end():]
+    else:
+        user_match = re.search(r"from:@(\S+)", query)
+        if user_match:
+            uid = _resolve_user_id_by_name(user_match.group(1))
+            if uid:
+                result["user_id"] = uid
+            query = query[:user_match.start()] + query[user_match.end():]
 
     date_match = re.search(r"date:(\d{4}-\d{2}-\d{2})(?:~(\d{4}-\d{2}-\d{2}))?", query)
     if date_match:

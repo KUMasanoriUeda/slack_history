@@ -100,6 +100,14 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_files_thread
             ON files(channel_id, thread_ts);
+
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            username TEXT,
+            display_name TEXT,
+            real_name TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
     """)
 
     fts_count = conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
@@ -179,6 +187,47 @@ def save_file(channel_id: str, message_ts: str, thread_ts: str | None,
             (channel_id, message_ts, thread_ts, user_id, file_id, file_name, file_type, local_path),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def save_user(user_id: str, username: str, display_name: str, real_name: str):
+    conn = get_connection()
+    try:
+        conn.execute(
+            """INSERT INTO users (user_id, username, display_name, real_name, updated_at)
+               VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   username=excluded.username, display_name=excluded.display_name,
+                   real_name=excluded.real_name, updated_at=CURRENT_TIMESTAMP""",
+            (user_id, username, display_name, real_name),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_user_by_id(user_id: str) -> dict | None:
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_user_by_name(name: str) -> dict | None:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """SELECT * FROM users
+               WHERE LOWER(username) = LOWER(?)
+                  OR LOWER(display_name) = LOWER(?)
+                  OR LOWER(real_name) = LOWER(?)
+               LIMIT 1""",
+            (name, name, name),
+        ).fetchone()
+        return dict(row) if row else None
     finally:
         conn.close()
 
