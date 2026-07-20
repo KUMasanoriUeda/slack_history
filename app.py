@@ -3,8 +3,9 @@ import os
 import re
 import shutil
 import logging
+import time
 import urllib.request
-from functools import lru_cache
+from datetime import datetime
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -24,11 +25,23 @@ db.init_db()
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 bot_user_id = None
 
+_CACHE_TTL = 3600
+_name_cache: dict[str, tuple[str, float]] = {}
+_id_cache: dict[str, tuple[str | None, float]] = {}
+_channel_member_cache: dict[str, tuple[bool, float]] = {}
 
-@lru_cache(maxsize=500)
+
 def _resolve_user_id_by_name(name: str) -> str | None:
+    now = time.time()
+    key = name.lower()
+    if key in _id_cache:
+        val, ts = _id_cache[key]
+        if now - ts < _CACHE_TTL and val is not None:
+            return val
+
     cached = db.get_user_by_name(name)
     if cached:
+        _id_cache[key] = (cached["user_id"], now)
         return cached["user_id"]
     try:
         cursor = None
@@ -43,28 +56,40 @@ def _resolve_user_id_by_name(name: str) -> str | None:
                 profile = member.get("profile", {})
                 _cache_user(member)
                 for field in (member.get("name", ""), profile.get("display_name", ""), profile.get("real_name", "")):
-                    if field and field.lower() == name.lower():
+                    if field and field.lower() == key:
+                        _id_cache[key] = (member["id"], now)
                         return member["id"]
             cursor = resp.get("response_metadata", {}).get("next_cursor")
             if not cursor:
                 break
         return None
     except Exception:
+        logger.exception("Failed to resolve user by name: %s", name)
         return None
 
 
-@lru_cache(maxsize=500)
 def _resolve_user_name(user_id: str) -> str:
+    now = time.time()
+    if user_id in _name_cache:
+        val, ts = _name_cache[user_id]
+        if now - ts < _CACHE_TTL:
+            return val
+
     cached = db.get_user_by_id(user_id)
     if cached:
-        return cached["display_name"] or cached["real_name"] or user_id
+        name = cached["display_name"] or cached["real_name"] or user_id
+        _name_cache[user_id] = (name, now)
+        return name
     try:
         resp = app.client.users_info(user=user_id)
         user = resp["user"]
         profile = user.get("profile", {})
         _cache_user(user)
-        return profile.get("display_name") or profile.get("real_name") or user_id
+        name = profile.get("display_name") or profile.get("real_name") or user_id
+        _name_cache[user_id] = (name, now)
+        return name
     except Exception:
+        logger.exception("Failed to resolve user name: %s", user_id)
         return user_id
 
 
@@ -98,6 +123,12 @@ def _download_file(url: str, dest: str):
 
 
 def _user_in_channel(user_id: str, channel_id: str) -> bool:
+    now = time.time()
+    cache_key = f"{user_id}:{channel_id}"
+    if cache_key in _channel_member_cache:
+        val, ts = _channel_member_cache[cache_key]
+        if now - ts < _CACHE_TTL:
+            return val
     try:
         cursor = None
         while True:
@@ -106,9 +137,11 @@ def _user_in_channel(user_id: str, channel_id: str) -> bool:
                 kwargs["cursor"] = cursor
             resp = app.client.conversations_members(**kwargs)
             if user_id in resp["members"]:
+                _channel_member_cache[cache_key] = (True, now)
                 return True
             cursor = resp.get("response_metadata", {}).get("next_cursor")
             if not cursor:
+                _channel_member_cache[cache_key] = (False, now)
                 return False
     except Exception:
         return False
@@ -286,8 +319,14 @@ def _parse_search_query(query: str) -> dict:
 
     date_match = re.search(r"date:(\d{4}-\d{2}-\d{2})(?:~(\d{4}-\d{2}-\d{2}))?", query)
     if date_match:
-        result["date_from"] = date_match.group(1)
-        result["date_to"] = date_match.group(2)
+        try:
+            datetime.strptime(date_match.group(1), "%Y-%m-%d")
+            result["date_from"] = date_match.group(1)
+            if date_match.group(2):
+                datetime.strptime(date_match.group(2), "%Y-%m-%d")
+                result["date_to"] = date_match.group(2)
+        except ValueError:
+            pass
         query = query[:date_match.start()] + query[date_match.end():]
 
     result["keyword"] = query.strip()
@@ -343,7 +382,10 @@ def _build_search_blocks(channel_id: str, query: str, parsed: dict,
         blocks.append({"type": "divider"})
 
     if total_pages > 1:
-        truncated_query = query[:500]
+        max_query_bytes = 1800
+        truncated_query = query
+        while len(truncated_query.encode("utf-8")) > max_query_bytes:
+            truncated_query = truncated_query[:-1]
         pagination_value = json.dumps({
             "q": truncated_query, "ch": channel_id, "p": page, "ts": thread_ts,
             "mode": mode,

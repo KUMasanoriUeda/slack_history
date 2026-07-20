@@ -136,15 +136,15 @@ def _ensure_thread(conn, channel_id: str, root_ts: str) -> int:
 def save_message(channel_id: str, message_ts: str, thread_ts: str | None, user_id: str, text: str) -> int:
     conn = get_connection()
     try:
-        root_ts = thread_ts or message_ts
-        thread_id = _ensure_thread(conn, channel_id, root_ts)
-        conn.execute(
-            """INSERT INTO messages (channel_id, message_ts, thread_ts, user_id, text)
-               VALUES (?, ?, ?, ?, ?)
-               ON CONFLICT(channel_id, message_ts) DO UPDATE SET text=excluded.text, user_id=excluded.user_id""",
-            (channel_id, message_ts, thread_ts, user_id, text),
-        )
-        conn.commit()
+        with conn:
+            root_ts = thread_ts or message_ts
+            thread_id = _ensure_thread(conn, channel_id, root_ts)
+            conn.execute(
+                """INSERT INTO messages (channel_id, message_ts, thread_ts, user_id, text)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(channel_id, message_ts) DO UPDATE SET text=excluded.text, user_id=excluded.user_id""",
+                (channel_id, message_ts, thread_ts, user_id, text),
+            )
         return thread_id
     finally:
         conn.close()
@@ -153,11 +153,11 @@ def save_message(channel_id: str, message_ts: str, thread_ts: str | None, user_i
 def update_message(channel_id: str, message_ts: str, new_text: str):
     conn = get_connection()
     try:
-        conn.execute(
-            "UPDATE messages SET text = ? WHERE channel_id = ? AND message_ts = ?",
-            (new_text, channel_id, message_ts),
-        )
-        conn.commit()
+        with conn:
+            conn.execute(
+                "UPDATE messages SET text = ? WHERE channel_id = ? AND message_ts = ?",
+                (new_text, channel_id, message_ts),
+            )
     finally:
         conn.close()
 
@@ -165,11 +165,11 @@ def update_message(channel_id: str, message_ts: str, new_text: str):
 def delete_message(channel_id: str, message_ts: str):
     conn = get_connection()
     try:
-        conn.execute(
-            "DELETE FROM messages WHERE channel_id = ? AND message_ts = ?",
-            (channel_id, message_ts),
-        )
-        conn.commit()
+        with conn:
+            conn.execute(
+                "DELETE FROM messages WHERE channel_id = ? AND message_ts = ?",
+                (channel_id, message_ts),
+            )
     finally:
         conn.close()
 
@@ -178,15 +178,15 @@ def save_file(channel_id: str, message_ts: str, thread_ts: str | None,
               user_id: str, file_id: str, file_name: str, file_type: str, local_path: str):
     conn = get_connection()
     try:
-        root_ts = thread_ts or message_ts
-        _ensure_thread(conn, channel_id, root_ts)
-        conn.execute(
-            """INSERT OR IGNORE INTO files
-               (channel_id, message_ts, thread_ts, user_id, file_id, file_name, file_type, local_path)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (channel_id, message_ts, thread_ts, user_id, file_id, file_name, file_type, local_path),
-        )
-        conn.commit()
+        with conn:
+            root_ts = thread_ts or message_ts
+            _ensure_thread(conn, channel_id, root_ts)
+            conn.execute(
+                """INSERT OR IGNORE INTO files
+                   (channel_id, message_ts, thread_ts, user_id, file_id, file_name, file_type, local_path)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (channel_id, message_ts, thread_ts, user_id, file_id, file_name, file_type, local_path),
+            )
     finally:
         conn.close()
 
@@ -194,15 +194,15 @@ def save_file(channel_id: str, message_ts: str, thread_ts: str | None,
 def save_user(user_id: str, username: str, display_name: str, real_name: str):
     conn = get_connection()
     try:
-        conn.execute(
-            """INSERT INTO users (user_id, username, display_name, real_name, updated_at)
-               VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-               ON CONFLICT(user_id) DO UPDATE SET
-                   username=excluded.username, display_name=excluded.display_name,
-                   real_name=excluded.real_name, updated_at=CURRENT_TIMESTAMP""",
-            (user_id, username, display_name, real_name),
-        )
-        conn.commit()
+        with conn:
+            conn.execute(
+                """INSERT INTO users (user_id, username, display_name, real_name, updated_at)
+                   VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                       username=excluded.username, display_name=excluded.display_name,
+                       real_name=excluded.real_name, updated_at=CURRENT_TIMESTAMP""",
+                (user_id, username, display_name, real_name),
+            )
     finally:
         conn.close()
 
@@ -320,39 +320,48 @@ def search_threads(channel_id: str, keyword: str, user_id: str | None = None,
             page_params,
         ).fetchall()
 
+        root_ts_list = [row["root_ts"] for row in rows]
+        placeholders = ",".join("?" * len(root_ts_list))
+
+        thread_rows = conn.execute(
+            f"SELECT thread_id, root_ts FROM threads WHERE channel_id = ? AND root_ts IN ({placeholders})",
+            [channel_id] + root_ts_list,
+        ).fetchall()
+        thread_id_map = {r["root_ts"]: r["thread_id"] for r in thread_rows}
+
+        all_msgs = conn.execute(
+            f"""SELECT user_id, text, message_ts, COALESCE(thread_ts, message_ts) AS root_ts
+                FROM messages
+                WHERE channel_id = ?
+                  AND COALESCE(thread_ts, message_ts) IN ({placeholders})
+                ORDER BY message_ts ASC""",
+            [channel_id] + root_ts_list,
+        ).fetchall()
+        msgs_by_root: dict[str, list] = {}
+        for m in all_msgs:
+            msgs_by_root.setdefault(m["root_ts"], []).append(m)
+
+        file_counts = conn.execute(
+            f"""SELECT COALESCE(thread_ts, message_ts) AS root_ts, COUNT(*) AS cnt
+                FROM files
+                WHERE channel_id = ?
+                  AND COALESCE(thread_ts, message_ts) IN ({placeholders})
+                GROUP BY root_ts""",
+            [channel_id] + root_ts_list,
+        ).fetchall()
+        file_count_map = {r["root_ts"]: r["cnt"] for r in file_counts}
+
         threads = []
-        for row in rows:
-            root_ts = row["root_ts"]
-            thread_row = conn.execute(
-                "SELECT thread_id FROM threads WHERE channel_id = ? AND root_ts = ?",
-                (channel_id, root_ts),
-            ).fetchone()
-            thread_id = thread_row["thread_id"] if thread_row else "?"
-
-            msgs = conn.execute(
-                """SELECT user_id, text, message_ts
-                   FROM messages
-                   WHERE channel_id = ?
-                     AND (message_ts = ? OR thread_ts = ?)
-                   ORDER BY message_ts ASC""",
-                (channel_id, root_ts, root_ts),
-            ).fetchall()
-
-            file_count = conn.execute(
-                """SELECT COUNT(*) as cnt FROM files
-                   WHERE channel_id = ?
-                     AND (message_ts = ? OR thread_ts = ?)""",
-                (channel_id, root_ts, root_ts),
-            ).fetchone()["cnt"]
-
+        for root_ts in root_ts_list:
+            msgs = msgs_by_root.get(root_ts, [])
             threads.append({
-                "thread_id": thread_id,
+                "thread_id": thread_id_map.get(root_ts, "?"),
                 "root_ts": root_ts,
                 "messages": [
                     {**dict(m), "datetime": _ts_to_datetime(m["message_ts"])}
                     for m in msgs
                 ],
-                "file_count": file_count,
+                "file_count": file_count_map.get(root_ts, 0),
             })
 
         total_pages = (total + per_page - 1) // per_page
